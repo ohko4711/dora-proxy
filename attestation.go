@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -183,24 +184,58 @@ func (t *AttestationTracker) getHeadSlot(ctx context.Context) (uint64, error) {
 }
 
 func (t *AttestationTracker) scanEpochRange(ctx context.Context, startEpoch, endEpoch uint64) (uint64, uint64, error) {
-	// iterate newest to oldest
+	// iterate newest to oldest, but process slots with bounded concurrency
+	const maxConcurrency = 16
+	jobs := make(chan uint64, maxConcurrency*2)
 	var slotsScanned uint64
 	var updates uint64
+	var wg sync.WaitGroup
+
+	// workers
+	for i := 0; i < maxConcurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for slot := range jobs {
+				// stop if context expired
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				u := t.processSlot(ctx, slot)
+				atomic.AddUint64(&slotsScanned, 1)
+				atomic.AddUint64(&updates, u)
+			}
+		}()
+	}
+
+	// producer: newest -> oldest
+	produceAborted := false
 	for epoch := startEpoch; ; epoch-- {
 		startSlot := epoch * slotsPerEpoch
 		endSlot := startSlot + (slotsPerEpoch - 1)
-		for slot := endSlot; slot >= startSlot; slot-- {
+		for slot := endSlot; ; slot-- {
 			// stop if context expired
 			select {
 			case <-ctx.Done():
-				return slotsScanned, updates, ctx.Err()
+				produceAborted = true
 			default:
 			}
-			slotsScanned++
-			updates += t.processSlot(ctx, slot)
+			if produceAborted {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				produceAborted = true
+			case jobs <- slot:
+			}
 			if slot == startSlot {
 				break
 			}
+		}
+		if produceAborted {
+			break
 		}
 		if epoch == endEpoch {
 			break
@@ -209,28 +244,60 @@ func (t *AttestationTracker) scanEpochRange(ctx context.Context, startEpoch, end
 			break
 		}
 	}
-	return slotsScanned, updates, nil
+	close(jobs)
+	wg.Wait()
+
+	if err := ctx.Err(); err != nil {
+		return atomic.LoadUint64(&slotsScanned), atomic.LoadUint64(&updates), err
+	}
+	return atomic.LoadUint64(&slotsScanned), atomic.LoadUint64(&updates), nil
 }
 
 func (t *AttestationTracker) processSlot(ctx context.Context, slot uint64) uint64 {
 	base := strings.TrimRight(t.consensusAPI, "/")
 	url := base + "/eth/v2/beacon/blocks/" + strconv.FormatUint(slot, 10)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		t.log.WithError(err).Debug("build request for block failed")
-		return 0
+
+	// Retry fetching the block a few times on transient failures
+	const maxAttempts = 3
+	var resp *http.Response
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			t.log.WithError(err).Debug("build request for block failed")
+			return 0
+		}
+		req.Header.Set("Accept", "application/json")
+
+		r, err := t.client.Do(req)
+		if err == nil && r != nil && r.StatusCode == http.StatusOK {
+			resp = r
+			break
+		}
+
+		if err != nil {
+			t.log.WithFields(logrus.Fields{"slot": slot, "attempt": attempt, "max": maxAttempts}).WithError(err).Debug("fetch block failed, will retry")
+		} else if r != nil {
+			t.log.WithFields(logrus.Fields{"slot": slot, "status": r.StatusCode, "attempt": attempt, "max": maxAttempts}).Debug("block request non-200, will retry")
+			// drain and close before retrying
+			io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+		}
+
+		if attempt == maxAttempts {
+			return 0
+		}
+
+		backoff := time.Duration(attempt*100) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(backoff):
+		}
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := t.client.Do(req)
-	if err != nil {
-		t.log.WithError(err).Debug("fetch block failed")
+	if resp == nil {
 		return 0
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.log.WithFields(logrus.Fields{"slot": slot, "status": resp.StatusCode}).Debug("block request non-200")
-		return 0
-	}
 	var payload map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
 		t.log.WithError(err).Debug("decode block JSON failed")
@@ -371,7 +438,7 @@ func attachLastAttestSlot(v interface{}, cache *LastAttestCache) {
 	case map[string]interface{}:
 		if val, has := m["validatorindex"]; has {
 			if idx, ok := parseUint64FromInterface(val); ok {
-				m["lastattestslot"] = cache.Get(idx)
+				m["lastattestationslot"] = cache.Get(idx)
 			}
 		}
 		// Recurse on nested objects/arrays
