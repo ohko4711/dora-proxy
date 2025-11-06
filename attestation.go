@@ -184,69 +184,56 @@ func (t *AttestationTracker) getHeadSlot(ctx context.Context) (uint64, error) {
 }
 
 func (t *AttestationTracker) scanEpochRange(ctx context.Context, startEpoch, endEpoch uint64) (uint64, uint64, error) {
-	// iterate newest to oldest, but process slots with bounded concurrency
+	// iterate newest to oldest, process with bounded concurrency via semaphore
 	const maxConcurrency = 16
-	jobs := make(chan uint64, maxConcurrency*2)
 	var slotsScanned uint64
 	var updates uint64
-	var wg sync.WaitGroup
 
-	// workers
-	for i := 0; i < maxConcurrency; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for slot := range jobs {
-				// stop if context expired
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				u := t.processSlot(ctx, slot)
-				atomic.AddUint64(&slotsScanned, 1)
-				atomic.AddUint64(&updates, u)
-			}
-		}()
-	}
-
-	// producer: newest -> oldest
-	produceAborted := false
+	// collect slots (newest -> oldest)
+	slotsToScan := make([]uint64, 0, (startEpoch-endEpoch+1)*slotsPerEpoch)
 	for epoch := startEpoch; ; epoch-- {
 		startSlot := epoch * slotsPerEpoch
 		endSlot := startSlot + (slotsPerEpoch - 1)
 		for slot := endSlot; ; slot-- {
-			// stop if context expired
-			select {
-			case <-ctx.Done():
-				produceAborted = true
-			default:
-			}
-			if produceAborted {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				produceAborted = true
-			case jobs <- slot:
-			}
+			slotsToScan = append(slotsToScan, slot)
 			if slot == startSlot {
 				break
 			}
 		}
-		if produceAborted {
-			break
-		}
-		if epoch == endEpoch {
-			break
-		}
-		if epoch == 0 { // avoid underflow
+		if epoch == endEpoch || epoch == 0 { // avoid underflow
 			break
 		}
 	}
-	close(jobs)
-	wg.Wait()
 
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+
+	// launch tasks with bounded concurrency
+	aborted := false
+	for _, slot := range slotsToScan {
+		select {
+		// get sem token
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			aborted = true
+		}
+		if aborted {
+			break
+		}
+		wg.Add(1)
+		go func(s uint64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ctx.Err() != nil {
+				return
+			}
+			u := t.processSlot(ctx, s)
+			atomic.AddUint64(&slotsScanned, 1)
+			atomic.AddUint64(&updates, u)
+		}(slot)
+	}
+
+	wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return atomic.LoadUint64(&slotsScanned), atomic.LoadUint64(&updates), err
 	}
