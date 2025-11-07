@@ -45,7 +45,7 @@ func buildRouter(cfg *proxyConfig, client *http.Client, upstream *url.URL, cache
 		}
 
 		path := "/v1/slot/" + id
-		// Enrich and then project into typed struct with snake_case tags
+		// Enrich and then project into Dora base fields + Beacon-missing fields
 		transform := func(body interface{}) {
 			root, ok := body.(map[string]interface{})
 			if !ok {
@@ -56,8 +56,7 @@ func buildRouter(cfg *proxyConfig, client *http.Client, upstream *url.URL, cache
 				return
 			}
 			enrichSlotConsensus(req.Context(), client, cfg.ConsensusAPIURL, id, data)
-			slot := buildSlotDataFromMap(data)
-			root["data"] = slot
+			root["data"] = buildSlotResponseFromMap(data)
 		}
 		proxyJSON(w, req, client, upstream, path, transform)
 	}).Methods(http.MethodGet)

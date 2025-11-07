@@ -116,6 +116,11 @@ func enrichSlotConsensus(ctx context.Context, client *http.Client, consensusAPI 
 		return
 	}
 
+	// Add dora missing fields: signature
+	if sig, ok := data["signature"].(string); ok && sig != "" {
+		setStringIfEmpty(slotData, "signature", sig)
+	}
+
 	// Eth1 data
 	if eth1, ok := body["eth1_data"].(map[string]interface{}); ok {
 		if v, ok := eth1["deposit_count"]; ok {
@@ -131,63 +136,42 @@ func enrichSlotConsensus(ctx context.Context, client *http.Client, consensusAPI 
 		}
 	}
 
-	// Execution payload
+	// Sync aggregate (body.sync_aggregate)
+	if sa, ok := body["sync_aggregate"].(map[string]interface{}); ok {
+		if v, ok := sa["sync_committee_bits"].(string); ok {
+			setStringIfEmpty(slotData, "syncaggregate_bits", v)
+		}
+		if v, ok := sa["sync_committee_signature"].(string); ok {
+			setStringIfEmpty(slotData, "syncaggregate_signature", v)
+		}
+	}
+
+	// Randao reveal (body.randao_reveal)
+	if rr, ok := body["randao_reveal"].(string); ok {
+		setStringIfEmpty(slotData, "randaoreveal", rr)
+	}
+
+	// Execution payload(exec_logs_bloom, exec_parent_hash, exec_random, exec_receipts_root, exec_state_root, exec_timestamp)
 	if exec, ok := body["execution_payload"].(map[string]interface{}); ok {
+		if v, ok := exec["logs_bloom"].(string); ok {
+			setStringIfEmpty(slotData, "exec_logs_bloom", v)
+		}
 		if v, ok := exec["parent_hash"].(string); ok {
 			setStringIfEmpty(slotData, "exec_parent_hash", v)
 		}
 		if v, ok := exec["prev_randao"].(string); ok {
 			setStringIfEmpty(slotData, "exec_random", v)
 		}
-		if v, ok := exec["receipt_root"].(string); ok { // some impls use receipt_root
-			setStringIfEmpty(slotData, "exec_receipts_root", v)
-		}
-		if v, ok := exec["receipts_root"].(string); ok { // standard: receipts_root
+		if v, ok := exec["receipts_root"].(string); ok { // some impls use receipt_root
 			setStringIfEmpty(slotData, "exec_receipts_root", v)
 		}
 		if v, ok := exec["state_root"].(string); ok {
 			setStringIfEmpty(slotData, "exec_state_root", v)
 		}
-		if v, ok := exec["logs_bloom"].(string); ok {
-			setStringIfEmpty(slotData, "exec_logs_bloom", v)
+		if v, ok := exec["timestamp"].(string); ok {
+			setStringIfEmpty(slotData, "exec_timestamp", v)
 		}
-		if v, ok := exec["timestamp"]; ok {
-			if n, ok2 := parseUint64FromInterface(v); ok2 {
-				setUintIfZero(slotData, "exec_timestamp", n)
-			}
-		}
-		if v, ok := exec["gas_limit"]; ok {
-			if n, ok2 := parseUint64FromInterface(v); ok2 {
-				setUintIfZero(slotData, "exec_gas_limit", n)
-			}
-		}
-		if v, ok := exec["gas_used"]; ok {
-			if n, ok2 := parseUint64FromInterface(v); ok2 {
-				setUintIfZero(slotData, "exec_gas_used", n)
-			}
-		}
-		if v, ok := exec["base_fee_per_gas"]; ok {
-			if n, ok2 := parseUint64FromInterface(v); ok2 {
-				setUintIfZero(slotData, "exec_base_fee_per_gas", n)
-			}
-		}
-		if v, ok := exec["block_number"]; ok {
-			if n, ok2 := parseUint64FromInterface(v); ok2 {
-				setUintIfZero(slotData, "exec_block_number", n)
-			}
-		}
-		if v, ok := exec["block_hash"].(string); ok {
-			setStringIfEmpty(slotData, "exec_block_hash", v)
-		}
-		if v, ok := exec["extra_data"].(string); ok {
-			setStringIfEmpty(slotData, "exec_extra_data", v)
-		}
-		if v, ok := exec["fee_recipient"].(string); ok {
-			setStringIfEmpty(slotData, "exec_fee_recipient", v)
-		}
-		if txs, ok := exec["transactions"].([]interface{}); ok {
-			setUintIfZero(slotData, "exec_transactions_count", uint64(len(txs)))
-		}
+
 	}
 }
 
