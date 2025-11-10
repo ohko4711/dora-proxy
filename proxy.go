@@ -94,7 +94,7 @@ func copyHeaders(dst, src http.Header) {
 
 func shouldSkipHeader(k string) bool {
 	switch strings.ToLower(k) {
-	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host":
+	case "accept-encoding", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host":
 		return true
 	default:
 		return false
